@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IgnorePilot — Free Gitignore Generator &amp; git check-ignore Tester Online</title>
+<meta name="description" content="IgnorePilot is a free gitignore generator and git check-ignore online simulator. Stack gitignore template node python java go and 12 more stacks into one deduped .gitignore, test any file path against your rules with pattern-by-pattern match explanations, and copy or download the result. No signup, unlimited free usage.">
+<script src="https://cdn.tailwindcss.com"></script>
+<script id="v3-ignorepilot-gitignore-builder-lib">
+
+/* ============================================================================
+ * IgnorePilot core library — pure, dependency-free .gitignore tooling.
+ * Pure functions only: no DOM access, no browser globals, no network calls.
+ * Implements gitignore pattern parsing, fnmatch-style matching with ** support,
+ * trailing-slash dir-only rules, ! negation, last-match-wins evaluation
+ * (git check-ignore semantics), plain-English pattern explanations, and
+ * multi-template stacking with duplicate merging.
+ * Exposed as: globalThis.IgnorePilotLib
+ * ========================================================================== */
+(function () {
+'use strict';
+
+/* ---------------- glob -> RegExp ---------------- */
+
+function escapeRegexChar(ch) {
+  return '[]\\^$.|?*+(){}'.indexOf(ch) !== -1 ? '\\' + ch : ch;
+}
+
+// Convert one path segment (no slashes) to regex source.
+// * -> any chars except /, ? -> one char except /, [...] -> char class.
+function segmentToRegex(seg) {
+  var out = '', i = 0, n = seg.length;
+  while (i < n) {
+    var c = seg.charAt(i);
+    if (c === '*') {
+      while (i + 1 < n && seg.charAt(i + 1) === '*') i++; // ** inside a segment == *
+      out += '[^/]*';
+      i++;
+    } else if (c === '?') {
+      out += '[^/]';
+      i++;
+    } else if (c === '[') {
+      var j = i + 1;
+      if (j < n && (seg.charAt(j) === '!' || seg.charAt(j) === '^')) j++;
+      if (j < n && seg.charAt(j) === ']') j++; // literal ] in first position
+      while (j < n && seg.charAt(j) !== ']') j++;
+      if (j >= n) { out += '\\['; i++; }       // unterminated -> literal [
+      else {
+        var cls = seg.slice(i + 1, j);
+        if (cls.charAt(0) === '!') cls = '^' + cls.slice(1);
+        out += '[' + cls + ']';
+        i = j + 1;
+      }
+    } else if (c === '\\' && i + 1 < n) {
+      out += escapeRegexChar(seg.charAt(i + 1)); // escaped literal
+      i += 2;
+    } else {
+      out += escapeRegexChar(c);
+      i++;
+    }
+  }
+  return out;
+}
+
+// Full pattern (no leading '/', no trailing '/') -> regex source (no anchors).
+// anchored=false means the pattern has no slash, so it may match at any depth.
+function patternToRegex(pattern, anchored) {
+  if (pattern === '**') return '.*'; // matches everything
+  var segs = pattern.split('/');
+  var re = '', start = 0, body = '', first = true, i, s;
+  if (segs[0] === '**') { re += '(?:.*/)?'; start = 1; } // leading **/
+  for (i = start; i < segs.length; i++) {
+    s = segs[i];
+    if (s === '**') {
+      if (i === segs.length - 1) body += first ? '(?:.*)?' : '(?:/.*)?'; // trailing /**
+      else body += '(?:/.*)?';                                         // middle /**/
+    } else {
+      body += (first ? '' : '/') + segmentToRegex(s);
+    }
+    first = false;
+  }
+  if (!anchored) re += '(?:.*/)?'; // match basename at any depth
+  return re + body;
+}
+
+/* ---------------- path helpers ---------------- */
+
+function normalizePath(p) {
+  var s = String(p == null ? '' : p).replace(/\\/g, '/');
+  s = s.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/+$/, '');
+  s = s.replace(/\/{2,}/g, '/');
+  return s;
+}
+
+/* ---------------- rule parsing ---------------- */
+
+// Parse one raw .gitignore line into a rule object.
+// kind: 'blank' | 'comment' | 'rule' | 'invalid'
+function parseRule(rawInput) {
+  var raw = String(rawInput == null ? '' : rawInput).replace(/\r$/, '');
+  if (raw.replace(/[ \t]+$/, '') === '') return { kind: 'blank', raw: raw };
+  var line = raw;
+  if (line.charAt(0) === '#') return { kind: 'comment', raw: raw, text: line.slice(1) };
+  var negated = false;
+  if (line.charAt(0) === '!') { negated = true; line = line.slice(1); }
+  else if (line.charAt(0) === '\\' && (line.charAt(1) === '#' || line.charAt(1) === '!')) {
+    line = line.slice(1); // escaped leading # or !
+  }
+  // Strip trailing spaces unless escaped with backslash (git rule).
+  var tmp = line.split('\\ ').join('');
+  tmp = tmp.replace(/[ \t]+$/, '');
+  line = tmp.split('').join(' ');
+  if (line === '') return { kind: 'blank', raw: raw };
+  var dirOnly = /\/$/.test(line);
+  var body = dirOnly ? line.slice(0, -1) : line;
+  // Git anchors a pattern when it has a separator at the beginning OR middle.
+  var anchored = body.charAt(0) === '/' || body.indexOf('/') !== -1;
+  if (body.charAt(0) === '/') body = body.slice(1);
+  if (body === '') return { kind: 'invalid', raw: raw, reason: 'empty pattern' };
+  // Suffix semantics: dir-only rules and literal (wildcard-free) names also match
+  // a directory prefix ("build" ignores "build/x", like real git). Wildcard
+  // patterns match the full path ("*.log" ignores "a.log", not "a.log/x").
+  var suffix;
+  if (dirOnly) suffix = '(?:/|$)';
+  else {
+    var wild = false;
+    for (var wi = 0; wi < body.length; wi++) {
+      var wc = body.charAt(wi);
+      if (wc === '\\') { wi++; continue; }
+      if (wc === '*' || wc === '?' || wc === '[') { wild = true; break; }
+    }
+    suffix = wild ? '$' : '(?:/|$)';
+  }
+  var src = '^' + patternToRegex(body, anchored) + suffix;
+  var rx;
+  try { rx = new RegExp(src); }
+  catch (e) { return { kind: 'invalid', raw: raw, reason: 'bad pattern' }; }
+  return {
+    kind: 'rule', raw: raw, pattern: line, body: body,
+    negated: negated, dirOnly: dirOnly, anchored: anchored,
+    regexSrc: src, regex: rx
+  };
+}
+
+// Parse a whole .gitignore text into rule objects (comments/blanks kept).
+function parseGitignore(text) {
+  return String(text == null ? '' : text).split('\n').map(parseRule);
+}
+
+// True when the rule matches the given path.
+function matchRule(rule, path) {
+  if (!rule || rule.kind !== 'rule') return false;
+  return rule.regex.test(normalizePath(path));
+}
+
+// Evaluate one path against rules in order. Last matching rule wins,
+// like `git check-ignore`. Returns { path, normalized, ignored, deciding,
+// matches, parentBlocked }.
+function checkIgnore(path, rules) {
+  var norm = normalizePath(path);
+  var matches = [];
+  var deciding = null;
+  (rules || []).forEach(function (r) {
+    if (!r || r.kind !== 'rule') return;
+    var m = r.regex.test(norm);
+    if (m) deciding = r;
+    matches.push({
+      raw: r.raw, pattern: r.pattern, negated: r.negated,
+      dirOnly: r.dirOnly, anchored: r.anchored,
+      matched: m, effect: !m ? 'no-match' : (r.negated ? 're-include' : 'ignore')
+    });
+  });
+  var ignored = !!(deciding && !deciding.negated);
+  // Git cannot re-include a file when one of its parent directories is
+  // ignored — surface that as a caveat instead of silently lying.
+  var parentBlocked = null;
+  if (!ignored) {
+    var parts = norm.split('/');
+    for (var i = parts.length - 1; i >= 1; i--) {
+      var anc = parts.slice(0, i).join('/');
+      var st = finalStatus(anc, rules || []);
+      if (st.ignored) {
+        parentBlocked = { ancestor: anc, rule: st.deciding ? st.deciding.raw : '' };
+        ignored = true;
+        break;
+      }
+    }
+  }
+  return {
+    path: path, normalized: norm, ignored: ignored,
+    deciding: deciding, matches: matches, parentBlocked: parentBlocked
+  };
+}
+
+// Final ignored status for a path, ignoring the parent-dir caveat (used
+// internally to detect when a re-include is blocked by an ignored ancestor).
+function finalStatus(norm, rules) {
+  var deciding = null;
+  for (var i = 0; i < rules.length; i++) {
+    var r = rules[i];
+    if (r && r.kind === 'rule' && r.regex.test(norm)) deciding = r;
+  }
+  return { ignored: !!(deciding && !deciding.negated), deciding: deciding };
+}
+
+/* ---------------- plain-English explanations ---------------- */
+
+function explainPattern(rawInput) {
+  var r = parseRule(rawInput);
+  if (r.kind === 'blank') return 'Blank line — has no effect.';
+  if (r.kind === 'comment') return 'Comment — documents the file, has no effect on ignoring.';
+  if (r.kind === 'invalid') return 'Not a usable pattern (' + r.reason + ').';
+  var verb = r.negated ? 'Exception — re-includes' : 'Ignores';
+  var where;
+  if (r.body === '**') {
+    where = 'everything in the repository';
+  } else if (r.dirOnly && !r.anchored && r.body.indexOf('/') === -1) {
+    where = 'every directory named "' + r.body + '" at any depth, plus everything inside those directories';
+  } else if (r.dirOnly && r.anchored) {
+    where = 'the "' + r.body + '" directory at the repository root, plus everything inside it';
+  } else if (r.dirOnly) {
+    where = 'directories matching "' + r.body + '" (relative to this .gitignore), plus everything inside them';
+  } else if (r.anchored) {
+    where = 'only "' + r.body + '" at the repository root — not deeper copies with the same name';
+  } else if (r.body.indexOf('/') === -1) {
+    where = 'files or folders named like "' + r.body + '" in this folder or any subfolder';
+  } else {
+    where = 'the path "' + r.body + '" relative to this .gitignore file';
+  }
+  var s = verb + ' ' + where + '.';
+  if (/[*?]/.test(r.body)) {
+    s += ' Wildcards: * matches any run of characters except /, ? matches exactly one character except /.';
+  }
+  if (r.body.indexOf('**') !== -1) {
+    s += ' ** crosses directory boundaries, matching any number of folders (including none).';
+  }
+  if (r.dirOnly) {
+    s += ' The trailing slash means "directories only" — a file with this name is not matched.';
+  }
+  if (r.negated) {
+    s += ' Note: a ! rule cannot re-include a file if one of its parent directories is itself ignored.';
+  }
+  return s;
+}
+
+/* ---------------- baked-in templates ---------------- */
+
+var TEMPLATES = [
+  { id: 'node', name: 'Node.js', desc: 'npm, yarn, pnpm, Next.js, Nuxt',
+    lines: ['node_modules/', 'npm-debug.log*', 'yarn-debug.log*', 'yarn-error.log*', 'pnpm-debug.log*',
+      '.pnpm-store/', '.yarn/*', '!.yarn/patches', '!.yarn/releases', '!.yarn/plugins',
+      'dist/', 'build/', 'coverage/', '.nyc_output/', '*.tsbuildinfo', '.turbo', '.next/', '.nuxt/',
+      '.env', '.env.local', '.env.*.local', '.DS_Store', '*.log'] },
+  { id: 'python', name: 'Python', desc: 'venv, pip, pytest, Jupyter',
+    lines: ['__pycache__/', '*.py[cod]', '*$py.class', '.venv/', 'venv/', 'env/', '.env',
+      'dist/', 'build/', '*.egg-info/', '.eggs/', 'pip-log.txt',
+      '.pytest_cache/', '.coverage', 'htmlcov/', '.mypy_cache/', '.tox/',
+      '.ipynb_checkpoints/', '.DS_Store'] },
+  { id: 'java', name: 'Java', desc: 'Maven, Gradle, IntelliJ',
+    lines: ['*.class', '*.jar', '*.war', '*.ear', 'target/', '.gradle/', 'build/', 'out/',
+      '.idea/', '*.iml', '.vscode/', 'hs_err_pid*', 'replay_pid*', '.DS_Store'] },
+  { id: 'go', name: 'Go', desc: 'binaries, test output',
+    lines: ['*.exe', '*.dll', '*.so', '*.dylib', '*.test', '*.out', '/bin/', '/dist/',
+      'coverage.out', '.DS_Store'] },
+  { id: 'rust', name: 'Rust', desc: 'Cargo build output',
+    lines: ['/target', '**/*.rs.bk', '*.pdb', '.env', '.DS_Store'] },
+  { id: 'ruby', name: 'Ruby', desc: 'Bundler, Rails',
+    lines: ['*.gem', '*.rbc', '/.config', '/coverage/', '/pkg/', '/spec/reports/', '/test/tmp/',
+      '/tmp/', '/log/*', '!/log/.keep', '!/tmp/.keep', '.byebug_history', '.DS_Store'] },
+  { id: 'php', name: 'PHP', desc: 'Composer, Laravel',
+    lines: ['/vendor/', 'composer.phar', '.env', '.env.backup', '.phpunit.result.cache',
+      '.phpunit.cache/', '/public/hot', '/public/storage', '/storage/*.key', '*.log', '.DS_Store'] },
+  { id: 'dotnet', name: '.NET', desc: 'Visual Studio, NuGet',
+    lines: ['[Bb]in/', '[Oo]bj/', '[Ll]og/', '*.user', '*.suo', '.vs/', 'TestResults/',
+      '*.nupkg', 'publish/', '.DS_Store'] },
+  { id: 'swift', name: 'Swift / Xcode', desc: 'iOS & macOS apps',
+    lines: ['.DS_Store', 'build/', '*.pbxuser', '!default.pbxuser', '*.mode1v3', '!default.mode1v3',
+      '*.mode2v3', '!default.mode2v3', '*.perspectivev3', '!default.perspectivev3',
+      'xcuserdata/', 'DerivedData/', '*.hmap', '*.ipa', '*.dSYM.zip', '*.dSYM', '.swiftpm/'] },
+  { id: 'android', name: 'Android', desc: 'Gradle, APKs',
+    lines: ['*.iml', '.gradle/', '/local.properties', '/.idea/', '.DS_Store', '/build',
+      '/captures', '.externalNativeBuild', '.cxx/', '*.apk', '*.aab', '*.ap_'] },
+  { id: 'flutter', name: 'Flutter', desc: 'Dart, generated code',
+    lines: ['.dart_tool/', '.flutter-plugins', '.flutter-plugins-dependencies', '.packages',
+      'build/', '.idea/', '*.iml', '.vscode/', '.DS_Store', '*.g.dart', '*.freezed.dart'] },
+  { id: 'terraform', name: 'Terraform', desc: 'state files, providers',
+    lines: ['.terraform/', '*.tfstate', '*.tfstate.*', '*.tfvars', '!*.tfvars.example',
+      'crash.log', 'crash.*.log', 'override.tf', 'override.tf.json', '*_override.tf', '.DS_Store'] },
+  { id: 'wordpress', name: 'WordPress', desc: 'uploads, cache, secrets',
+    lines: ['wp-config.php', '/wp-content/uploads/', '/wp-content/cache/', '/wp-content/backup*/',
+      '*.log', '.DS_Store'] },
+  { id: 'latex', name: 'LaTeX', desc: 'build artefacts',
+    lines: ['*.aux', '*.bbl', '*.blg', '*.brf', '*.fdb_latexmk', '*.fls', '*.idx', '*.ilg',
+      '*.ind', '*.lof', '*.lot', '*.out', '*.toc', '*.synctex.gz', '*.log', '/build/'] },
+  { id: 'jupyter', name: 'Jupyter / Data', desc: 'notebooks, data scratch',
+    lines: ['.ipynb_checkpoints/', '__pycache__/', '*.py[cod]', '.venv/', 'venv/', '.env',
+      '.DS_Store', 'data/raw/*', '!data/raw/.gitkeep', '*.pkl'] },
+  { id: 'cpp', name: 'C / C++', desc: 'CMake, Make, objects',
+    lines: ['*.o', '*.obj', '*.a', '*.lib', '*.so', '*.dll', '*.dylib', '*.exe', '*.out',
+      '*.app', '/build/', '/bin/', 'CMakeFiles/', 'CMakeCache.txt', 'cmake_install.cmake',
+      '.vs/', '.DS_Store'] }
+];
+
+function templateById(id) {
+  for (var i = 0; i < TEMPLATES.length; i++) {
+    if (TEMPLATES[i].id === id) return TEMPLATES[i];
+  }
+  return null;
+}
+
+/* ---------------- multi-template stacking ---------------- */
+
+// Stack template ids (in order) plus optional custom rules text into one
+// merged .gitignore, dropping exact duplicate rule lines (first wins).
+function buildGitignore(ids, customText) {
+  var seen = {};
+  var lines = [];
+  var dupes = 0, rules = 0, used = [];
+  function addLine(ln) {
+    var key = String(ln).replace(/[ \t]+$/, '');
+    if (key === '' || key.charAt(0) === '#') { lines.push(ln); return; }
+    rules++;
+    if (seen[key]) { dupes++; return; }
+    seen[key] = true;
+    lines.push(ln);
+  }
+  lines.push('# .gitignore composed with IgnorePilot');
+  lines.push('# Stack templates, add your own rules, then paste into your repo root.');
+  (ids || []).forEach(function (id) {
+    var t = templateById(id);
+    if (!t) return;
+    used.push(t.name);
+    lines.push('');
+    lines.push('# ===== ' + t.name + ' =====');
+    t.lines.forEach(addLine);
+  });
+  var custom = String(customText == null ? '' : customText);
+  if (custom.replace(/[ \t\r\n]+/g, '') !== '') {
+    lines.push('');
+    lines.push('# ===== Your custom rules =====');
+    custom.split('\n').forEach(addLine);
+  }
+  return {
+    text: lines.join('\n') + '\n',
+    templates: used,
+    rules: rules,
+    duplicatesRemoved: dupes
+  };
+}
+
+/* ---------------- exports ---------------- */
+
+globalThis.IgnorePilotLib = {
+  TEMPLATES: TEMPLATES,
+  templateById: templateById,
+  parseRule: parseRule,
+  parseGitignore: parseGitignore,
+  matchRule: matchRule,
+  checkIgnore: checkIgnore,
+  explainPattern: explainPattern,
+  buildGitignore: buildGitignore,
+  normalizePath: normalizePath,
+  patternToRegex: patternToRegex,
+  segmentToRegex: segmentToRegex
+};
+
+})();
+
+
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Is IgnorePilot free, and do I need an account?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Yes, IgnorePilot is completely free with unlimited usage. There is no signup, no account, no paywall and no watermark. Everything runs in your browser: the template composer, the gitignore pattern matcher and the check-ignore simulator never send your data anywhere." }
+    },
+    {
+      "@type": "Question",
+      "name": "How does the git check-ignore simulator work?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Paste your .gitignore rules, type a file path such as build/output/app.js, and press Check. IgnorePilot evaluates every pattern in order, shows which patterns matched the path and which did not, and applies git's last-match-wins rule to give an IGNORED or NOT IGNORED verdict — the same logic as the real `git check-ignore` command. It even warns you when a re-include is blocked because a parent directory is ignored, a subtlety of real git behavior." }
+    },
+    {
+      "@type": "Question",
+      "name": "What does a ! negation rule do in .gitignore?",
+      "acceptedAnswer": { "@type": "Answer", "text": "A pattern starting with ! re-includes a file that an earlier rule ignored. For example, `*.log` followed by `!keep.log` ignores every log file except keep.log. The catch: git cannot re-include a file if one of its parent directories is itself ignored, so `build/` followed by `!build/keep.js` still leaves keep.js ignored. IgnorePilot's simulator detects this trap and explains it." }
+    },
+    {
+      "@type": "Question",
+      "name": "What is the difference between build/ and build in .gitignore?",
+      "acceptedAnswer": { "@type": "Answer", "text": "The trailing slash means directories only. `build/` ignores a directory named build and everything inside it, wherever it appears in the repo, but never a file named build. Without the slash, `build` ignores both files and directories named build. A leading slash like `/build` anchors the pattern to the repository root, so it only matches the top-level build directory." }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I combine templates for several stacks, like Node.js and Python?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Yes — that is exactly what IgnorePilot's composer is for. Tick any of the 16 stack templates (Node.js, Python, Java, Go, Rust, Ruby, PHP, .NET, Swift, Android, Flutter, Terraform, WordPress, LaTeX, Jupyter, C/C++), add your own custom rules, and IgnorePilot merges everything into one .gitignore, automatically removing duplicate lines. Copy the result or download it as a .gitignore file." }
+    },
+    {
+      "@type": "Question",
+      "name": "Does IgnorePilot upload my .gitignore or file paths anywhere?",
+      "acceptedAnswer": { "@type": "Answer", "text": "No. All matching, merging and explanation happens locally in your browser with plain JavaScript. Your rules and the paths you test never leave your device, so you can safely simulate ignore rules for private or work repositories." }
+    }
+  ]
+}
+</script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  .tpl-card input { accent-color: #f97316; }
+  .tpl-card:has(input:checked) { border-color: #f97316; background: rgba(249,115,22,.10); }
+  details.faq summary::-webkit-details-marker { display: none; }
+  details.faq summary { cursor: pointer; }
+  details.faq[open] summary .faq-chev { transform: rotate(180deg); }
+  .faq-chev { transition: transform .2s ease; }
+  .term-dot { width: 11px; height: 11px; border-radius: 9999px; display: inline-block; }
+  .glow-line { background: linear-gradient(90deg, #f97316, #84cc16); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: #16120c; }
+  ::-webkit-scrollbar-thumb { background: #3f3222; border-radius: 8px; }
+</style>
+</head>
+<body id="top" class="bg-[#16120c] text-stone-200 antialiased">
+
+<!-- ============ STICKY HEADER ============ -->
+<header class="sticky top-0 z-50 bg-[#16120c]/95 backdrop-blur border-b border-orange-500/25">
+  <div class="mx-auto max-w-6xl px-4 sm:px-6 h-16 flex items-center justify-between">
+    <a href="#top" class="flex items-center gap-2.5">
+      <span class="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-orange-500 text-[#16120c] font-black text-lg mono">&gt;_</span>
+      <span class="text-2xl font-extrabold tracking-tight text-orange-500">Ignore<span class="text-lime-400">Pilot</span></span>
+    </a>
+    <nav class="flex items-center gap-5 text-sm font-semibold">
+      <a href="#top" class="text-stone-300 hover:text-orange-400 transition">Home</a>
+      <a href="https://fixoraa.tech" class="text-stone-300 hover:text-orange-400 transition">More Tools</a>
+    </nav>
+  </div>
+</header>
+
+<!-- ============ HERO ============ -->
+<section class="relative overflow-hidden">
+  <div class="glow-line h-1 w-full"></div>
+  <div class="mx-auto max-w-6xl px-4 sm:px-6 py-10 sm:py-14 text-center">
+    <span class="inline-block rounded-full border border-lime-400/50 bg-lime-400/10 px-4 py-1.5 text-xs font-bold uppercase tracking-[0.18em] text-lime-300">Unlimited Free Usage &middot; No Signup</span>
+    <h1 class="mt-4 text-3xl sm:text-5xl font-extrabold tracking-tight text-white">Compose the perfect <span class="text-orange-500">.gitignore</span>, then <span class="text-lime-400">prove</span> it works</h1>
+    <p class="mt-3 max-w-2xl mx-auto text-stone-400 text-sm sm:text-base">Stack templates for 16 popular stacks into one clean, deduped <span class="mono text-orange-300">.gitignore</span> — then run any file path through a faithful <span class="mono text-lime-300">git check-ignore</span> simulation with pattern-by-pattern match explanations. 100% in your browser.</p>
+    <div class="mt-5 flex flex-wrap justify-center gap-2 text-[11px] font-semibold">
+      <span class="rounded-full bg-white/5 px-3 py-1 text-orange-300 border border-orange-500/30">16 stack templates</span>
+      <span class="rounded-full bg-white/5 px-3 py-1 text-lime-300 border border-lime-400/30">check-ignore simulator</span>
+      <span class="rounded-full bg-white/5 px-3 py-1 text-orange-300 border border-orange-500/30">negation handling</span>
+      <span class="rounded-full bg-white/5 px-3 py-1 text-lime-300 border border-lime-400/30">plain-English rules</span>
+    </div>
+  </div>
+</section>
+
+<!-- TOP AD (verbatim) -->
+<div class="no-print mx-auto max-w-6xl px-4 sm:px-6 pt-4" role="complementary" aria-label="Advertisement">
+  <div class="mx-auto text-center" style="max-width:728px">
+    <span class="block text-[10px] tracking-[0.18em] uppercase text-slate-400 mb-1.5">Advertisement</span>
+    <div class="flex justify-center overflow-hidden">
+      <div class="origin-top scale-[0.44] sm:scale-100 shrink-0">
+        <script>
+          atOptions = { 'key' : '4e68ac77881c17fe128a46565d9a4e8c', 'format' : 'iframe', 'height' : 90, 'width' : 728, 'params' : {} };
+        </script>
+        <script src="https://www.highrevenueformat.com/4e68ac77881c17fe128a46565d9a4e8c/invoke.js"></script>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ TOOL ============ -->
+<main class="mx-auto max-w-6xl px-4 sm:px-6 py-6">
+  <div class="grid gap-6 lg:grid-cols-2">
+
+    <!-- ======== COMPOSER PANE ======== -->
+    <section class="rounded-2xl bg-[#1f1810] ring-1 ring-orange-500/25 shadow-xl overflow-hidden flex flex-col">
+      <div class="px-5 sm:px-6 pt-5 pb-3 border-b border-orange-500/15">
+        <div class="flex items-center gap-2">
+          <span class="term-dot bg-red-500"></span><span class="term-dot bg-yellow-500"></span><span class="term-dot bg-lime-500"></span>
+          <h2 class="ml-2 text-lg font-bold text-orange-400 mono">~/composer</h2>
+        </div>
+        <p class="mt-2 text-xs text-stone-400">Tick the stacks your project uses. Duplicates are merged automatically.</p>
+      </div>
+      <div class="px-5 sm:px-6 py-4">
+        <div id="template-list" class="grid grid-cols-2 sm:grid-cols-2 gap-2 max-h-64 overflow-y-auto pr-1"></div>
+        <label class="mt-4 block text-xs font-bold uppercase tracking-wider text-lime-300" for="custom-rules">Your custom rules <span class="text-stone-500 normal-case font-normal">(optional)</span></label>
+        <textarea id="custom-rules" rows="3" spellcheck="false" placeholder="*.pem&#10;secrets/&#10;!secrets/.keep" class="mono mt-1.5 w-full rounded-lg bg-black/50 border border-stone-700 focus:border-orange-500 outline-none px-3 py-2 text-sm text-lime-200 placeholder:text-stone-600"></textarea>
+      </div>
+      <div class="px-5 sm:px-6 pb-2">
+        <div class="flex items-center justify-between">
+          <h3 class="text-sm font-bold text-stone-300 mono">.gitignore <span id="composer-stats" class="text-stone-500 font-normal"></span></h3>
+          <div class="flex gap-2">
+            <button id="copy-btn" class="rounded-lg bg-orange-500 hover:bg-orange-400 text-[#16120c] text-xs font-bold px-3 py-1.5 transition">Copy</button>
+            <button id="download-btn" class="rounded-lg bg-lime-400 hover:bg-lime-300 text-[#16120c] text-xs font-bold px-3 py-1.5 transition">Download</button>
+          </div>
+        </div>
+        <textarea id="composer-output" rows="12" readonly spellcheck="false" class="mono mt-2 w-full rounded-lg bg-black/60 border border-stone-800 px-3 py-2 text-[13px] leading-relaxed text-orange-200"></textarea>
+        <button id="load-tester-btn" class="mt-2 w-full rounded-lg border border-lime-400/40 text-lime-300 hover:bg-lime-400/10 text-xs font-bold px-3 py-2 transition">Load this .gitignore into the check-ignore lab &rarr;</button>
+        <p id="copy-note" class="mt-1 h-4 text-[11px] text-lime-300"></p>
+      </div>
+    </section>
+
+    <!-- ======== CHECK-IGNORE LAB PANE ======== -->
+    <section class="rounded-2xl bg-[#1f1810] ring-1 ring-lime-400/25 shadow-xl overflow-hidden flex flex-col">
+      <div class="px-5 sm:px-6 pt-5 pb-3 border-b border-lime-400/15">
+        <div class="flex items-center gap-2">
+          <span class="term-dot bg-red-500"></span><span class="term-dot bg-yellow-500"></span><span class="term-dot bg-lime-500"></span>
+          <h2 class="ml-2 text-lg font-bold text-lime-300 mono">~/check-ignore --lab</h2>
+        </div>
+        <p class="mt-2 text-xs text-stone-400">Simulates <span class="mono text-lime-200">git check-ignore</span> in your browser — wildcards, directory rules, <span class="mono">**</span> and <span class="mono">!</span> negations included.</p>
+      </div>
+      <div class="px-5 sm:px-6 py-4">
+        <label class="block text-xs font-bold uppercase tracking-wider text-orange-300" for="tester-rules">.gitignore rules to test</label>
+        <textarea id="tester-rules" rows="7" spellcheck="false" class="mono mt-1.5 w-full rounded-lg bg-black/50 border border-stone-700 focus:border-lime-400 outline-none px-3 py-2 text-sm text-lime-200 placeholder:text-stone-600">*.log
+build/
+!important.log</textarea>
+        <label class="mt-4 block text-xs font-bold uppercase tracking-wider text-orange-300" for="tester-path">File path to test</label>
+        <div class="mt-1.5 flex gap-2">
+          <input id="tester-path" type="text" spellcheck="false" placeholder="build/output/app.js" value="build/output.log" class="mono flex-1 rounded-lg bg-black/50 border border-stone-700 focus:border-lime-400 outline-none px-3 py-2 text-sm text-orange-200 placeholder:text-stone-600">
+          <button id="check-btn" class="rounded-lg bg-lime-400 hover:bg-lime-300 text-[#16120c] text-sm font-bold px-4 py-2 transition shrink-0">Check</button>
+        </div>
+        <div class="mt-2 flex flex-wrap gap-1.5 text-[11px]">
+          <span class="text-stone-500">Try:</span>
+          <button class="sample-path rounded bg-white/5 border border-stone-700 px-2 py-0.5 mono text-stone-300 hover:border-orange-500" data-p="debug.log">debug.log</button>
+          <button class="sample-path rounded bg-white/5 border border-stone-700 px-2 py-0.5 mono text-stone-300 hover:border-orange-500" data-p="src/keep.log">src/keep.log</button>
+          <button class="sample-path rounded bg-white/5 border border-stone-700 px-2 py-0.5 mono text-stone-300 hover:border-orange-500" data-p="important.log">important.log</button>
+          <button class="sample-path rounded bg-white/5 border border-stone-700 px-2 py-0.5 mono text-stone-300 hover:border-orange-500" data-p="build/output/app.js">build/output/app.js</button>
+        </div>
+      </div>
+      <div class="px-5 sm:px-6 pb-5">
+        <div id="verdict" class="rounded-xl border border-stone-700 bg-black/40 px-4 py-3 text-sm text-stone-400">Enter a path and press <span class="font-bold text-lime-300">Check</span> to see the verdict.</div>
+        <div id="pattern-explain" class="mt-3 hidden rounded-xl border border-orange-500/30 bg-orange-500/5 px-4 py-3 text-[13px] text-orange-200"></div>
+        <h3 class="mt-4 text-xs font-bold uppercase tracking-wider text-stone-400">Pattern-by-pattern trace</h3>
+        <div id="match-table" class="mono mt-1.5 max-h-56 overflow-y-auto rounded-lg border border-stone-800 text-[12px]">
+          <p class="px-3 py-2 text-stone-500">No trace yet.</p>
+        </div>
+        <p class="mt-2 text-[11px] text-stone-500">Semantics: patterns ending in <span class="mono">/</span> match directories only; wildcard patterns match the full path; plain names also match directory prefixes. Last matching rule wins, like real git.</p>
+      </div>
+    </section>
+  </div>
+
+  <!-- pattern explainer strip -->
+  <section class="mt-6 rounded-2xl bg-[#1f1810] ring-1 ring-stone-700/60 p-5 sm:p-6">
+    <h2 class="text-base font-bold text-white">What does this pattern mean? <span class="text-stone-500 font-normal text-sm">— plain-English decoder</span></h2>
+    <div class="mt-3 flex gap-2">
+      <input id="explain-input" type="text" spellcheck="false" placeholder="e.g. **/temp, !keep.log, /dist, [Dd]ebug/" class="mono flex-1 rounded-lg bg-black/50 border border-stone-700 focus:border-orange-500 outline-none px-3 py-2 text-sm text-orange-200 placeholder:text-stone-600">
+      <button id="explain-btn" class="rounded-lg bg-orange-500 hover:bg-orange-400 text-[#16120c] text-sm font-bold px-4 py-2 transition shrink-0">Explain</button>
+    </div>
+    <p id="explain-output" class="mt-3 text-sm text-stone-300 min-h-[1.5rem]"></p>
+  </section>
+</main>
+
+<!-- BOTTOM AD (verbatim) -->
+<div class="no-print mx-auto max-w-6xl px-4 sm:px-6 pb-4" role="complementary" aria-label="Advertisement">
+  <div class="mx-auto text-center" style="max-width:728px">
+    <span class="block text-[10px] tracking-[0.18em] uppercase text-slate-400 mb-1.5">Advertisement</span>
+    <div class="flex justify-center overflow-hidden">
+      <script async src="https://js.wpadmngr.com/static/adManager.js" data-admpid="464498"></script>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SEO ARTICLE ============ -->
+<article class="mx-auto max-w-4xl px-4 sm:px-6 pb-10 text-stone-300 text-[15px] leading-relaxed">
+<!--ARTICLE-START-->
+<h2 class="text-2xl font-extrabold text-white mt-6 mb-3">The Complete Guide to .gitignore: Generator, Patterns, and git check-ignore Online</h2>
+<p>Every Git repository has a quiet gatekeeper: the <span class="mono text-orange-300">.gitignore</span> file. It decides which files Git should pretend do not exist — build output, dependency folders, log files, editor settings, secrets. Get it right and your repository stays clean, small, and safe to share. Get it wrong and you either commit megabytes of junk or, worse, leak an API key to a public repo. This guide explains how gitignore patterns actually work, how to compose a solid file with a <strong>gitignore generator</strong> like IgnorePilot, and how to verify your rules with a <strong>git check-ignore online</strong> simulator before they bite you.</p>
+
+<h3 class="text-xl font-bold text-white mt-8 mb-2">What is a .gitignore file?</h3>
+<p>A <span class="mono text-orange-300">.gitignore</span> is a plain-text file, usually in the root of your repository, containing one pattern per line. Git consults it whenever it scans your working tree: any path matching a pattern is "ignored", meaning Git will not show it in <span class="mono">git status</span>, will not stage it with <span class="mono">git add .</span>, and will not complain about it being untracked. Ignored files are not deleted — they stay on your disk exactly where they are. Git simply agrees not to track them. You can also place <span class="mono">.gitignore</span> files in subdirectories; those apply to that directory and everything below it, which is handy for monorepos where the frontend and backend have different ignore needs.</p>
+<p>Blank lines are skipped and lines starting with <span class="mono">#</span> are comments, so document your rules generously — future you will thank present you. Everything else is a pattern, and patterns follow a small but surprisingly subtle glob language.</p>
+
+<h3 class="text-xl font-bold text-white mt-8 mb-2">How gitignore patterns work: the five rules that matter</h3>
+<p><strong>1. A pattern without a slash matches by name, anywhere.</strong> <span class="mono text-lime-300">*.log</span> ignores every file ending in <span class="mono">.log</span> in the repository root and in every subdirectory. This is the rule most beginners rely on, and it is usually what you want for file extensions.</p>
+<p><strong>2. A slash in the middle (or at the start) anchors the pattern to the .gitignore location.</strong> <span class="mono text-lime-300">doc/frotz</span> ignores only <span class="mono">doc/frotz</span> relative to the gitignore file — not <span class="mono">other/doc/frotz</span>. A leading slash makes the anchoring explicit: <span class="mono text-lime-300">/build</span> matches the top-level <span class="mono">build</span> only.</p>
+<p><strong>3. A trailing slash means directories only.</strong> <span class="mono text-lime-300">build/</span> ignores a directory named <span class="mono">build</span> and everything inside it, at any depth — but it will never ignore a file that happens to be named <span class="mono">build</span>. Without the slash, <span class="mono">build</span> matches both files and directories. This distinction is one of the most common sources of confusion, and it is why IgnorePilot's plain-English decoder calls it out explicitly.</p>
+<p><strong>4. Wildcards have directory-aware meanings.</strong> <span class="mono">*</span> matches any run of characters except <span class="mono">/</span>, <span class="mono">?</span> matches exactly one character except <span class="mono">/</span>, and <span class="mono">[abc]</span> matches one character from a set or range. The double star <span class="mono">**</span> is the power tool: a leading <span class="mono">**/</span> matches in all directories (<span class="mono">**/temp</span> finds <span class="mono">temp</span> at any depth), a trailing <span class="mono">/**</span> matches everything inside a directory (<span class="mono">logs/**</span>), and <span class="mono">a/**/b</span> matches <span class="mono">a/b</span>, <span class="mono">a/x/b</span>, <span class="mono">a/x/y/b</span>, and so on.</p>
+<p><strong>5. Order matters: the last matching pattern wins.</strong> Git reads your rules top to bottom and the final pattern that matches a path decides its fate. This is what makes negation possible.</p>
+
+<h3 class="text-xl font-bold text-white mt-8 mb-2">Negation rules: the ! exception</h3>
+<p>Prefixing a pattern with <span class="mono">!</span> re-includes a path that an earlier rule ignored. The classic example is ignoring all logs but keeping one that matters: <span class="mono">*.log</span> followed by <span class="mono">!keep.log</span>. Because the last match wins, <span class="mono">keep.log</span> survives while every other log file stays ignored. Negations are also how teams keep placeholder files in otherwise-ignored folders: <span class="mono">/tmp/*</span> plus <span class="mono">!/tmp/.keep</span> is a pattern you will see in Rails projects everywhere.</p>
+<p>But negation has a famous trap, and it is worth understanding because it surprises even experienced developers: <strong>git cannot re-include a file if one of its parent directories is excluded.</strong> If your rules say <span class="mono">build/</span> and then <span class="mono">!build/keep.js</span>, the file <span class="mono">build/keep.js</span> stays ignored. Git skips the contents of ignored directories entirely for performance, so the negation never gets a chance to apply. The fix is to re-include the directory first (<span class="mono">!build/</span>) and then narrow down, or to ignore the directory's contents instead of the directory itself (<span class="mono">build/*</span>). IgnorePilot's check-ignore simulator detects this exact situation and tells you the parent directory is blocking your exception — a detail most online testers miss.</p>
+
+<h3 class="text-xl font-bold text-white mt-8 mb-2">Why use a gitignore generator instead of copy-pasting?</h3>
+<p>Most developers start a project by googling "gitignore template node python" and pasting the first file they find. That works until your project is not a pure Node.js or pure Python project — which, in 2026, is almost always. A typical side project might be a Python API, a React dashboard, a Terraform deployment, and a LaTeX-written report living in one repository. Pasting four template files together by hand means duplicated lines, conflicting rules, and no easy way to check what you actually ended up with.</p>
+<p>A proper <strong>gitignore generator</strong> solves the stacking problem: you pick the stacks you use, it merges the templates, removes exact duplicates, and hands you one clean file. IgnorePilot ships with 16 curated templates — Node.js, Python, Java, Go, Rust, Ruby, PHP, .NET, Swift/Xcode, Android, Flutter, Terraform, WordPress, LaTeX, Jupyter/data-science, and C/C++ — and lets you layer your own custom rules on top. The composer shows you live stats (how many rules, how many duplicates were removed) so the output stays reviewable, not a mysterious wall of text.</p>
+
+<h3 class="text-xl font-bold text-white mt-8 mb-2">Verifying rules with git check-ignore online</h3>
+<p>Writing rules is only half the job; the other half is knowing what they actually match. The real <span class="mono">git check-ignore</span> command answers one question: "would git ignore this path?" You give it a path, it gives you the rule that decided. IgnorePilot recreates that behavior as a <strong>git check-ignore online</strong> tool with one big upgrade: a pattern-by-pattern trace. Instead of just the verdict, you see every rule in your file, whether it matched the path, and whether its effect was to ignore, re-include, or do nothing. When a path surprises you — and it will — the trace shows you exactly which line is responsible.</p>
+<p>This turns gitignore from guesswork into a testable process. Before committing your file, run your trickiest paths through the simulator: the build output you want ignored, the one log file you want kept, the secrets directory that must never be committed. If the verdict is wrong, the trace tells you which pattern to fix, and the plain-English decoder translates that pattern into words you can reason about.</p>
+
+<h3 class="text-xl font-bold text-white mt-8 mb-2">Common .gitignore mistakes (and how to avoid them)</h3>
+<p><strong>Committing the file late.</strong> Gitignore only affects untracked files. If you already committed <span class="mono">node_modules</span> or a <span class="mono">.env</span> file, adding a rule later will not remove it from history — you need <span class="mono">git rm --cached</span> for that, and if secrets were involved, you should rotate them because they are in the history forever.</p>
+<p><strong>Ignoring too broadly.</strong> A rule like <span class="mono">*</span> or <span class="mono">data/</span> can silently swallow files you meant to commit. Prefer specific patterns, and when you must use a broad one, add targeted <span class="mono">!</span> exceptions — then test them in the simulator.</p>
+<p><strong>Forgetting OS and editor files.</strong> <span class="mono">.DS_Store</span>, <span class="mono">Thumbs.db</span>, <span class="mono">.idea/</span>, and <span class="mono">.vscode/</span> have no business in a repository. Better yet, put them in your global gitignore (<span class="mono">git config --global core.excludesFile</span>) so every project on your machine is covered.</p>
+<p><strong>Committing secrets.</strong> This is the expensive one. A <span class="mono">.env</span> rule is cheap insurance, but pair it with a pre-commit check: if your repository is already public, assume anything ever committed is compromised.</p>
+<p><strong>One template for a polyglot repo.</strong> If your repo mixes stacks — say a <strong>gitignore template node python</strong> combination — generate a stacked file instead of picking one template and hoping. Each stack brings its own build folders, caches, and lockfiles.</p>
+
+<h3 class="text-xl font-bold text-white mt-8 mb-2">Best practices for a clean repository</h3>
+<p>Start with the generator, then review: read through the composed file once and delete anything that does not apply — a smaller gitignore is easier to trust. Keep stack templates in labeled sections with comments, so the next contributor understands why <span class="mono">*.tfstate</span> is there. Commit the <span class="mono">.gitignore</span> file itself (it is meant to be shared), and treat changes to it like code: review the diff, run your test paths through the check-ignore simulator, and only then push. For monorepos, use per-directory gitignore files to keep each package's rules close to its code. Finally, re-audit twice a year: stacks evolve, build tools change their output folders, and a rule that was essential in 2024 may be dead weight today.</p>
+<p>IgnorePilot exists to make all of this frictionless: compose in the left pane, prove in the right pane, decode any pattern in plain English below, then copy or download your <span class="mono">.gitignore</span> and get back to building. Your repository's gatekeeper deserves five careful minutes — this page gives you the tools to spend them well.</p>
+<!--ARTICLE-END-->
+
+  <!-- ============ FAQs ============ -->
+  <section class="mt-10">
+    <h2 class="text-2xl font-extrabold text-white mb-4">Frequently asked questions</h2>
+    <div class="space-y-3">
+      <details class="faq rounded-xl bg-[#1f1810] ring-1 ring-stone-700/60 px-5 py-4">
+        <summary class="flex items-center justify-between font-semibold text-white">Is IgnorePilot free, and do I need an account?<span class="faq-chev text-orange-400">&#9662;</span></summary>
+        <p class="mt-2 text-sm text-stone-400">Yes, IgnorePilot is completely free with unlimited usage. There is no signup, no account, no paywall and no watermark. Everything runs in your browser: the template composer, the gitignore pattern matcher and the check-ignore simulator never send your data anywhere.</p>
+      </details>
+      <details class="faq rounded-xl bg-[#1f1810] ring-1 ring-stone-700/60 px-5 py-4">
+        <summary class="flex items-center justify-between font-semibold text-white">How does the git check-ignore simulator work?<span class="faq-chev text-orange-400">&#9662;</span></summary>
+        <p class="mt-2 text-sm text-stone-400">Paste your .gitignore rules, type a file path such as <span class="mono text-lime-300">build/output/app.js</span>, and press Check. IgnorePilot evaluates every pattern in order, shows which patterns matched the path and which did not, and applies git's last-match-wins rule to give an IGNORED or NOT IGNORED verdict — the same logic as the real <span class="mono">git check-ignore</span> command. It even warns you when a re-include is blocked because a parent directory is ignored.</p>
+      </details>
+      <details class="faq rounded-xl bg-[#1f1810] ring-1 ring-stone-700/60 px-5 py-4">
+        <summary class="flex items-center justify-between font-semibold text-white">What does a ! negation rule do in .gitignore?<span class="faq-chev text-orange-400">&#9662;</span></summary>
+        <p class="mt-2 text-sm text-stone-400">A pattern starting with <span class="mono">!</span> re-includes a file that an earlier rule ignored. For example, <span class="mono">*.log</span> followed by <span class="mono">!keep.log</span> ignores every log file except keep.log. The catch: git cannot re-include a file if one of its parent directories is itself ignored, so <span class="mono">build/</span> followed by <span class="mono">!build/keep.js</span> still leaves keep.js ignored.</p>
+      </details>
+      <details class="faq rounded-xl bg-[#1f1810] ring-1 ring-stone-700/60 px-5 py-4">
+        <summary class="flex items-center justify-between font-semibold text-white">What is the difference between build/ and build in .gitignore?<span class="faq-chev text-orange-400">&#9662;</span></summary>
+        <p class="mt-2 text-sm text-stone-400">The trailing slash means directories only. <span class="mono">build/</span> ignores a directory named build and everything inside it, at any depth — but never a file named build. Without the slash, <span class="mono">build</span> matches both files and directories named build. A leading slash like <span class="mono">/build</span> anchors the pattern to the repository root.</p>
+      </details>
+      <details class="faq rounded-xl bg-[#1f1810] ring-1 ring-stone-700/60 px-5 py-4">
+        <summary class="flex items-center justify-between font-semibold text-white">Can I combine templates for several stacks, like Node.js and Python?<span class="faq-chev text-orange-400">&#9662;</span></summary>
+        <p class="mt-2 text-sm text-stone-400">Yes — that is exactly what IgnorePilot's composer is for. Tick any of the 16 stack templates (Node.js, Python, Java, Go, Rust, Ruby, PHP, .NET, Swift, Android, Flutter, Terraform, WordPress, LaTeX, Jupyter, C/C++), add your own custom rules, and IgnorePilot merges everything into one .gitignore, automatically removing duplicate lines. Copy the result or download it as a .gitignore file.</p>
+      </details>
+      <details class="faq rounded-xl bg-[#1f1810] ring-1 ring-stone-700/60 px-5 py-4">
+        <summary class="flex items-center justify-between font-semibold text-white">Does IgnorePilot upload my .gitignore or file paths anywhere?<span class="faq-chev text-orange-400">&#9662;</span></summary>
+        <p class="mt-2 text-sm text-stone-400">No. All matching, merging and explanation happens locally in your browser with plain JavaScript. Your rules and the paths you test never leave your device, so you can safely simulate ignore rules for private or work repositories.</p>
+      </details>
+    </div>
+  </section>
+</article>
+
+<!-- ============ FOOTER ============ -->
+<footer class="border-t border-orange-500/20">
+  <div class="glow-line h-px w-full opacity-40"></div>
+  <div class="mx-auto max-w-6xl px-4 sm:px-6 py-6 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-stone-500">
+    <span><span class="font-bold text-orange-500">IgnorePilot</span> — free gitignore tools, forever. 100% in-browser.</span>
+    <nav class="flex items-center gap-5 font-semibold">
+      <a href="#top" class="hover:text-orange-400 transition">Home</a>
+      <a href="https://fixoraa.tech" class="hover:text-orange-400 transition">More Tools</a>
+    </nav>
+  </div>
+</footer>
+
+<!-- ============ UI WIRING (non-lib script) ============ -->
+<script>
+(function () {
+  'use strict';
+  var L = globalThis.IgnorePilotLib;
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  /* ---------- composer ---------- */
+  var listEl = $('template-list');
+  L.TEMPLATES.forEach(function (t) {
+    var label = document.createElement('label');
+    label.className = 'tpl-card flex items-start gap-2 rounded-lg border border-stone-700/70 bg-black/30 px-2.5 py-2 cursor-pointer transition';
+    var box = document.createElement('input');
+    box.type = 'checkbox';
+    box.value = t.id;
+    box.className = 'tpl-check mt-0.5 shrink-0';
+    if (t.id === 'node' || t.id === 'python') box.checked = true;
+    var span = document.createElement('span');
+    span.innerHTML = '<span class="block text-[13px] font-bold text-stone-100">' + esc(t.name) + '</span>' +
+      '<span class="block text-[10px] text-stone-500">' + esc(t.desc) + '</span>';
+    label.appendChild(box);
+    label.appendChild(span);
+    label.addEventListener('change', updateComposer);
+    listEl.appendChild(label);
+  });
+
+  function selectedIds() {
+    var ids = [];
+    listEl.querySelectorAll('.tpl-check:checked').forEach(function (c) { ids.push(c.value); });
+    return ids;
+  }
+
+  function updateComposer() {
+    var res = L.buildGitignore(selectedIds(), $('custom-rules').value);
+    $('composer-output').value = res.text;
+    $('composer-stats').textContent = '— ' + res.templates.length + ' template' + (res.templates.length === 1 ? '' : 's') +
+      ', ' + res.rules + ' rules' + (res.duplicatesRemoved ? ', ' + res.duplicatesRemoved + ' dupes merged' : '');
+  }
+  $('custom-rules').addEventListener('input', updateComposer);
+  updateComposer();
+
+  $('copy-btn').addEventListener('click', function () {
+    var txt = $('composer-output').value;
+    function done() { $('copy-note').textContent = 'Copied to clipboard.'; setTimeout(function () { $('copy-note').textContent = ''; }, 2000); }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).then(done, function () { fallback(); });
+    } else { fallback(); }
+    function fallback() {
+      $('composer-output').select();
+      try { document.execCommand('copy'); } catch (e) {}
+      done();
+    }
+  });
+  $('download-btn').addEventListener('click', function () {
+    var blob = new Blob([$('composer-output').value], { type: 'text/plain' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = '.gitignore';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  });
+  $('load-tester-btn').addEventListener('click', function () {
+    $('tester-rules').value = $('composer-output').value;
+    runCheck();
+    $('tester-path').focus();
+  });
+
+  /* ---------- check-ignore lab ---------- */
+  function runCheck() {
+    var rules = L.parseGitignore($('tester-rules').value);
+    var path = $('tester-path').value.trim();
+    var verdict = $('verdict');
+    var table = $('match-table');
+    if (!path) {
+      verdict.className = 'rounded-xl border border-stone-700 bg-black/40 px-4 py-3 text-sm text-stone-400';
+      verdict.textContent = 'Enter a file path to test.';
+      return;
+    }
+    var res = L.checkIgnore(path, rules);
+    var ruleCount = rules.filter(function (r) { return r.kind === 'rule'; }).length;
+    var html;
+    if (res.ignored) {
+      var why = res.parentBlocked
+        ? 'Blocked: parent directory <span class="mono text-orange-300">' + esc(res.parentBlocked.ancestor) + '/</span> is ignored by <span class="mono text-orange-300">' + esc(res.parentBlocked.rule) + '</span> — git cannot re-include files under an ignored directory.'
+        : 'Matched by <span class="mono text-orange-300">' + esc(res.deciding.raw) + '</span> (last matching rule wins).';
+      html = '<div class="flex items-center gap-3"><span class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-orange-500 text-[#16120c] text-xl font-black">!</span>' +
+        '<div><p class="font-extrabold text-orange-400 text-base">IGNORED</p>' +
+        '<p class="text-[13px] text-stone-300"><span class="mono text-stone-100">' + esc(res.normalized) + '</span> would be ignored by git.</p>' +
+        '<p class="text-[13px] text-stone-400 mt-1">' + why + '</p></div></div>';
+      verdict.className = 'rounded-xl border border-orange-500/50 bg-orange-500/10 px-4 py-3';
+    } else {
+      var why2 = (res.deciding && res.deciding.negated)
+        ? 'Re-included by <span class="mono text-lime-300">' + esc(res.deciding.raw) + '</span> (last matching rule wins).'
+        : 'No rule matched this path.';
+      html = '<div class="flex items-center gap-3"><span class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-lime-400 text-[#16120c] text-xl font-black">&#10003;</span>' +
+        '<div><p class="font-extrabold text-lime-300 text-base">NOT IGNORED</p>' +
+        '<p class="text-[13px] text-stone-300"><span class="mono text-stone-100">' + esc(res.normalized) + '</span> would be tracked by git.</p>' +
+        '<p class="text-[13px] text-stone-400 mt-1">' + why2 + '</p></div></div>';
+      verdict.className = 'rounded-xl border border-lime-400/50 bg-lime-400/10 px-4 py-3';
+    }
+    verdict.innerHTML = html;
+
+    // pattern-by-pattern trace
+    var rows = res.matches.map(function (m) {
+      var badge = m.effect === 'ignore'
+        ? '<span class="rounded bg-orange-500/20 text-orange-300 border border-orange-500/40 px-1.5 py-0.5">ignore</span>'
+        : m.effect === 're-include'
+          ? '<span class="rounded bg-lime-400/20 text-lime-300 border border-lime-400/40 px-1.5 py-0.5">re-include</span>'
+          : '<span class="rounded bg-white/5 text-stone-500 border border-stone-700 px-1.5 py-0.5">no match</span>';
+      var mark = m.matched ? '<span class="text-lime-300 font-bold">&#10003;</span>' : '<span class="text-stone-600">&middot;</span>';
+      return '<div class="flex items-center gap-2 px-3 py-1.5 border-b border-stone-800/60 last:border-0">' +
+        '<span class="w-4 text-center">' + mark + '</span>' +
+        '<span class="flex-1 truncate text-stone-200">' + esc(m.raw) + '</span>' + badge + '</div>';
+    }).join('');
+    table.innerHTML = rows || '<p class="px-3 py-2 text-stone-500">No rules found.</p>';
+
+    // plain-English explanation of the deciding rule
+    var pe = $('pattern-explain');
+    if (res.deciding) {
+      pe.classList.remove('hidden');
+      pe.innerHTML = '<span class="font-bold text-orange-300">Deciding rule:</span> <span class="mono">' + esc(res.deciding.raw) + '</span><br>' + esc(L.explainPattern(res.deciding.raw));
+    } else {
+      pe.classList.add('hidden');
+    }
+  }
+  $('check-btn').addEventListener('click', runCheck);
+  $('tester-path').addEventListener('keydown', function (e) { if (e.key === 'Enter') runCheck(); });
+  document.querySelectorAll('.sample-path').forEach(function (b) {
+    b.addEventListener('click', function () { $('tester-path').value = b.getAttribute('data-p'); runCheck(); });
+  });
+
+  /* ---------- pattern explainer ---------- */
+  function runExplain() {
+    var v = $('explain-input').value;
+    $('explain-output').textContent = v.trim() ? L.explainPattern(v) : '';
+  }
+  $('explain-btn').addEventListener('click', runExplain);
+  $('explain-input').addEventListener('keydown', function (e) { if (e.key === 'Enter') runExplain(); });
+
+  runCheck();
+})();
+</script>
+</body>
+</html>
